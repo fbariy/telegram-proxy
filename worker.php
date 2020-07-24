@@ -6,6 +6,7 @@ use Psr\Http\Message\ResponseInterface;
 use Symfony\Component\Dotenv\Dotenv;
 use Vector\Lib\Arrays;
 use Vector\Lib\Lambda;
+use function GuzzleHttp\Promise\settle;
 
 require_once 'vendor/autoload.php';
 
@@ -14,7 +15,7 @@ require_once 'vendor/autoload.php';
 $token = $_ENV['BOT_TOKEN'];
 $webhookUri = $_ENV['WEBHOOK_URI'];
 
-$httpClient = new Client(['base_uri' => "https://api.telegram.org", 'verify' => false]);
+$httpClient = new Client(['verify' => false, 'http_errros' => false]);
 $updates = Lambda::curry('getUpdates')($httpClient)($token);
 
 while (true) {
@@ -36,7 +37,7 @@ function getUpdates(Client $httpClient, string $token, GetUpdates $params): Prom
     ];
 
     return $httpClient
-        ->getAsync("/bot{$token}/getUpdates", ['json' => $json])
+        ->getAsync("https://api.telegram.org/bot{$token}/getUpdates", ['json' => $json])
         ->then(function(ResponseInterface $response) {
             if (200 !== $response->getStatusCode()) {
                 throw new Exception("Not expected response code: {$response->getStatusCode()}");
@@ -50,31 +51,37 @@ function getUpdates(Client $httpClient, string $token, GetUpdates $params): Prom
 
             return $decoded['result'];
         });
-};
+}
 
 /**
+ * @param Client $httpClient
  * @param string $webhookUri
  * @param callable(GetUpdates): array $getUpdates
- * @param int $offset
- *
+ * @param GetUpdates $params
  * @return PromiseInterface<null>
  */
-function sendUpdates(string $webhookUri, callable $getUpdates, int $offset = 0): PromiseInterface {
-    /** @var PromiseInterface $updates */
-    $updates = $getUpdates(new GetUpdates($offset));
-
-    return $updates->then(function (array $updates) use ($webhookUri, $getUpdates) {
+function sendUpdates(Client $httpClient, string $webhookUri, callable $getUpdates, GetUpdates $params): PromiseInterface {
+    $sendUpdates = function (array $updates) use ($httpClient, $webhookUri, $getUpdates) {
         if (empty($updates)) {
-            echo 'на небе только и разговоры что о дебаге' . PHP_EOL;
+            echo 'no incoming updates...' . PHP_EOL;
             return null;
         }
 
-        //todo: send requests
-        echo 'Send: ' . implode(', ', Arrays::map(fn(array $update) => $update['update_id'])($updates)) . PHP_EOL;
+        $clientPromise = fn(array $update) => $httpClient->postAsync($webhookUri, ['json' => $update]);
+
+        return settle(Arrays::map($updates, $clientPromise));
+        echo 'Sent: ' . implode(', ', Arrays::map(fn(array $update) => $update['update_id'])($updates)) . PHP_EOL;
 
         return sendUpdates($webhookUri, $getUpdates, Arrays::last($updates)['update_id'] + 1);
-    });
-};
+    };
+
+    return $getUpdates($params)
+        ->then($sendUpdates)
+        ->then(fn(?array $result) => null === $result
+            ? null
+            : sendUpdates($httpClient, $webhookUri, $getUpdates, )
+        );
+}
 
 class GetUpdates
 {
