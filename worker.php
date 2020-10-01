@@ -6,7 +6,9 @@ use Psr\Http\Message\ResponseInterface;
 use Symfony\Component\Dotenv\Dotenv;
 use Vector\Lib\Arrays;
 use Vector\Lib\Lambda;
-use function GuzzleHttp\Promise\settle;
+
+use function GuzzleHttp\Promise\all;
+use function GuzzleHttp\Promise\promise_for;
 
 require_once 'vendor/autoload.php';
 
@@ -15,12 +17,13 @@ require_once 'vendor/autoload.php';
 $token = $_ENV['BOT_TOKEN'];
 $webhookUri = $_ENV['WEBHOOK_URI'];
 
-$httpClient = new Client(['verify' => false, 'http_errros' => false]);
-$updates = Lambda::curry('getUpdates')($httpClient)($token);
+$httpClient = new Client(['verify' => false, 'http_errors' => false]);
+$getUpdatesFn = Lambda::curry('getUpdates')($httpClient)($token);
 
-while (true) {
-    sendUpdates($webhookUri, $updates)->wait();
+while(true) {
+    tempScope($httpClient, $webhookUri, $getUpdatesFn)->wait();
 }
+
 
 /**
  * @param Client $httpClient
@@ -53,34 +56,29 @@ function getUpdates(Client $httpClient, string $token, GetUpdates $params): Prom
         });
 }
 
-/**
- * @param Client $httpClient
- * @param string $webhookUri
- * @param callable(GetUpdates): array $getUpdates
- * @param GetUpdates $params
- * @return PromiseInterface<null>
- */
-function sendUpdates(Client $httpClient, string $webhookUri, callable $getUpdates, GetUpdates $params): PromiseInterface {
-    $sendUpdates = function (array $updates) use ($httpClient, $webhookUri, $getUpdates) {
-        if (empty($updates)) {
-            echo 'no incoming updates...' . PHP_EOL;
-            return null;
-        }
-
-        $clientPromise = fn(array $update) => $httpClient->postAsync($webhookUri, ['json' => $update]);
-
-        return settle(Arrays::map($updates, $clientPromise));
-        echo 'Sent: ' . implode(', ', Arrays::map(fn(array $update) => $update['update_id'])($updates)) . PHP_EOL;
-
-        return sendUpdates($webhookUri, $getUpdates, Arrays::last($updates)['update_id'] + 1);
+# todo: rename variables, functions and callbacks
+function tempScope(Client $http, string $uri, callable $getUpdates)
+{
+    $fn = function(GetUpdates $model) use ($getUpdates, $http, $uri, &$fn): PromiseInterface {
+        return $getUpdates($model)
+            ->then(fn(array $updates) =>
+                empty($updates)
+                    ? promise_for(null)
+                    : all(Arrays::map(fn(array $update) => $http->postAsync($uri, ['json' => $update]))($updates))
+                        ->then(function(array $responses) use($fn, $updates) {
+                            echo sprintf(
+                                "Отправлено сообщений: %d\n%s\n",
+                                count($updates),
+                                implode(PHP_EOL, array_map(fn(ResponseInterface $response) =>
+                                    (string)$response->getBody(), $responses)
+                                )
+                            );
+                            return $fn(new GetUpdates(Arrays::last($updates)['update_id'] + 1));
+                        })
+            );
     };
 
-    return $getUpdates($params)
-        ->then($sendUpdates)
-        ->then(fn(?array $result) => null === $result
-            ? null
-            : sendUpdates($httpClient, $webhookUri, $getUpdates, )
-        );
+    return $fn(new GetUpdates(0));
 }
 
 class GetUpdates
